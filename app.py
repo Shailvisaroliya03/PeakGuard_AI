@@ -1,0 +1,555 @@
+import datetime as dt
+import json
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+import streamlit as st
+import joblib
+import altair as alt
+import textwrap
+import hashlib
+import time
+import requests
+
+# -------------------------------------------------------------------
+# 1. PAGE CONFIG & CSS
+# -------------------------------------------------------------------
+st.set_page_config(
+    page_title="PeakGuard AI",
+    page_icon="🌱",
+    layout="wide",
+)
+
+# Define CSS separately to avoid Syntax Errors
+css_code = """
+<style>
+/* Global Dark Theme */
+.stApp {
+    background: radial-gradient(circle at top, #0f172a 0%, #020617 80%);
+}
+
+/* Control Panel */
+.control-panel {
+    background-color: #1e293b;
+    padding: 20px;
+    border-radius: 15px;
+    border: 1px solid #334155;
+}
+
+/* IMPACT CARDS */
+.metric-card {
+    padding: 20px;
+    border-radius: 12px;
+    text-align: center;
+    margin-bottom: 10px;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: rgba(30, 41, 59, 0.5);
+}
+.card-green { background-color: rgba(34, 197, 94, 0.15); border-color: #22c55e; }
+.card-red { background-color: rgba(239, 68, 68, 0.15); border-color: #ef4444; }
+
+.metric-card h3 { font-size: 0.9rem; margin: 0; opacity: 0.8; color: #cbd5e1; }
+.metric-card h1 { font-size: 2.2rem; margin: 5px 0; font-weight: 700; color: #fff; }
+.metric-card p { font-size: 0.8rem; margin: 0; opacity: 0.7; color: #94a3b8; }
+
+/* === FUTURISTIC AI UI STYLES === */
+.ai-container {
+    background: rgba(15, 23, 42, 0.8);
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.1);
+    padding: 0;
+    overflow: hidden;
+    margin-top: 0px;
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+}
+
+.ai-header {
+    padding: 15px 20px;
+    font-weight: 700;
+    font-size: 1.1rem;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    letter-spacing: 0.5px;
+}
+.ai-header.critical { background: linear-gradient(90deg, #7f1d1d 0%, #450a0a 100%); color: #fecaca; border-bottom: 1px solid #ef4444; }
+.ai-header.safe { background: linear-gradient(90deg, #064e3b 0%, #065f46 100%); color: #d1fae5; border-bottom: 1px solid #34d399; }
+.ai-header.auto { background: linear-gradient(90deg, #1e3a8a 0%, #172554 100%); color: #bfdbfe; border-bottom: 1px solid #3b82f6; }
+
+.ai-body { padding: 20px; }
+
+.ai-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: #64748b;
+    font-weight: 700;
+    margin-bottom: 5px;
+    margin-top: 15px;
+}
+.ai-label:first-child { margin-top: 0; }
+
+.ai-text { font-size: 0.95rem; line-height: 1.5; color: #e2e8f0; margin-bottom: 10px; }
+
+/* Button Override */
+div.stButton > button {
+    width: 100%;
+    border-radius: 8px;
+    font-weight: bold;
+    border: 1px solid rgba(255,255,255,0.1);
+}
+
+/* Blockchain Explorer Style */
+.blockchain-box {
+    font-family: 'Courier New', monospace;
+    background: #000;
+    color: #0f0;
+    padding: 10px;
+    border-radius: 5px;
+    font-size: 0.8rem;
+    border: 1px solid #333;
+}
+</style>
+"""
+
+st.markdown(css_code, unsafe_allow_html=True)
+
+# -------------------------------------------------------------------
+# 2. SESSION STATE & LOAD RESOURCES
+# -------------------------------------------------------------------
+if 'battery_active' not in st.session_state:
+    st.session_state.battery_active = False
+if 'hvac_active' not in st.session_state:
+    st.session_state.hvac_active = False
+if 'auto_mode' not in st.session_state:
+    st.session_state.auto_mode = False
+# BLOCKCHAIN STATE
+if 'blockchain_ledger' not in st.session_state:
+    st.session_state.blockchain_ledger = []
+if 'wallet_balance' not in st.session_state:
+    st.session_state.wallet_balance = 0.0
+
+
+@st.cache_resource
+def load_resources():
+    try:
+        model = lgb.Booster(model_file='lgbm_model.txt')
+        feature_names = joblib.load('feature_names.pkl')
+        try:
+            categorical_features = joblib.load('categorical_features.pkl')
+        except FileNotFoundError:
+            categorical_features = []
+        meta = pd.read_csv('building_metadata.csv')
+        return model, feature_names, categorical_features, meta
+    except Exception as exc:
+        st.error(
+            "Failed to load the LightGBM model resources. "
+            "Make sure `lgbm_model.txt`, `feature_names.pkl`, "
+            "`categorical_features.pkl`, and `building_metadata.csv` exist, "
+            "and that the required packages are installed."
+        )
+        st.exception(exc)
+        st.stop()
+
+
+def create_donut(val, max_v, label, colors):
+    pct = min((val / max_v) * 100, 100) if max_v > 0 else 0
+    rem = 100 - pct
+    source = pd.DataFrame({"c": [label, ""], "v": [pct, rem]})
+    base = alt.Chart(source).encode(theta=alt.Theta("v", stack=True))
+    pie = base.mark_arc(innerRadius=55, outerRadius=75).encode(
+        color=alt.Color("c", scale=alt.Scale(domain=[label, ""], range=colors), legend=None)
+    )
+    text = base.mark_text(radius=0, size=18, color="white").encode(text=alt.value(f"{int(pct)}%"))
+    return (pie + text).properties(height=180)
+
+
+# BLOCKCHAIN FUNCTIONS
+def generate_hash(data):
+    return hashlib.sha256(data.encode()).hexdigest()
+
+
+def mint_block(co2_saved):
+    if co2_saved <= 0:
+        return None
+
+    timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    prev_hash = st.session_state.blockchain_ledger[-1][
+        'hash'] if st.session_state.blockchain_ledger else "00000000000000000000"
+
+    # Create Block Data
+    block_data = f"{timestamp}-{co2_saved}-{prev_hash}"
+    new_hash = generate_hash(block_data)
+
+    # 1 Token = 10kg CO2
+    tokens = co2_saved / 10.0
+
+    block = {
+        "index": len(st.session_state.blockchain_ledger) + 1,
+        "timestamp": timestamp,
+        "co2_saved": round(co2_saved, 2),
+        "tokens_minted": round(tokens, 4),
+        "hash": new_hash,
+        "prev_hash": prev_hash[:10] + "..."
+    }
+
+    st.session_state.blockchain_ledger.append(block)
+    st.session_state.wallet_balance += tokens
+    return new_hash
+
+
+model, feature_names, categorical_features, metadata = load_resources()
+
+# -------------------------------------------------------------------
+# 3. CONTROL PANEL
+# -------------------------------------------------------------------
+st.title("🌱 PeakGuard AI")
+
+with st.expander("⚙️ **Simulation Control Panel**", expanded=True):
+    col_main, col_spacer = st.columns([2, 1])
+    with col_main:
+        st.session_state.auto_mode = st.toggle("Enable Auto-Pilot Mode",
+                                               value=st.session_state.auto_mode)
+
+    st.divider()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.caption("BUILDING PROFILE")
+        primary_uses = metadata['primary_use'].unique()
+        selected_use = st.selectbox("Type", primary_uses, index=0)
+        subset = metadata[metadata['primary_use'] == selected_use]
+        sq_ft = st.number_input("Area (sq ft)", value=int(subset['square_feet'].mean()), step=5000)
+        contract_limit = st.number_input("⚡ Contract Limit (kW)", value=500.0, step=10.0)
+
+    with c2:
+        st.caption("ENVIRONMENT & SOLAR")
+        solar_capacity = st.number_input("☀️ Solar Capacity (kW)", value=100.0, step=10.0)
+        current_temp = st.slider("Outdoor Temp (°C)", -10, 42, 28)
+        st.write("")
+
+    with c3:
+        st.caption("TIME & HISTORY")
+        hour_pick = st.slider("Hour of Day (24h)", 0, 23, 14)
+        lag_1 = st.number_input("Load 1hr ago (kW)", value=300.0)
+        lag_24 = st.number_input("Load 24hr ago (kW)", value=310.0)
+
+# -------------------------------------------------------------------
+# 4. CALCULATION CORE
+# -------------------------------------------------------------------
+# Pricing Logic
+if 16 <= hour_pick <= 21:  # Peak Hours
+    electricity_rate = 24.0
+    rate_label = "🔴 PEAK RATE (₹24/kWh)"
+    tariff_color = "#ef4444"
+elif 13 <= hour_pick <= 16:
+    electricity_rate = 18.0
+    rate_label = "🟠 HIGH RATE (₹18/kWh)"
+    tariff_color = "#f97316"
+else:
+    electricity_rate = 10.0
+    rate_label = "🟢 NORMAL RATE (₹10/kWh)"
+    tariff_color = "#22c55e"
+
+# Input Vector
+input_data = pd.DataFrame(columns=feature_names)
+input_data.loc[0] = 0
+input_data['square_feet'] = sq_ft
+input_data['year_built'] = 2005
+input_data['floor_count'] = 1
+input_data['air_temperature'] = current_temp
+input_data['cloud_coverage'] = 2
+input_data['dew_temperature'] = current_temp - 5
+input_data['month'] = 6
+input_data['hour_sin'] = np.sin(2 * np.pi * hour_pick / 24)
+input_data['hour_cos'] = np.cos(2 * np.pi * hour_pick / 24)
+input_data['day_of_week_sin'] = 0
+input_data['day_of_week_cos'] = 1
+input_data['meter_reading_lag1'] = lag_1
+input_data['meter_reading_lag24'] = lag_24
+if f"primary_use_{selected_use}" in input_data.columns:
+    input_data[f"primary_use_{selected_use}"] = 1
+
+# Base Prediction
+raw_log_pred = model.predict(input_data)[0]
+raw_pred = np.expm1(raw_log_pred)
+if raw_pred > 200000: raw_pred = raw_log_pred
+raw_pred = max(0, raw_pred)
+
+is_daytime = 7 <= hour_pick <= 18
+sun_intensity = 0.95
+solar_gen = 0.0
+if is_daytime:
+    efficiency = max(0, 1 - abs(hour_pick - 13) / 6)
+    solar_gen = solar_capacity * efficiency * sun_intensity
+
+# Mitigation Logic
+mitigation_impact = 0.0
+base_load = max(0, raw_pred - solar_gen)
+potential_breach = base_load > contract_limit
+battery_contrib = 0.0
+hvac_contrib = 0.0
+
+auto_triggered = False
+if st.session_state.auto_mode and potential_breach:
+    battery_contrib = 50.0
+    hvac_contrib = raw_pred * 0.15
+    mitigation_impact = battery_contrib + hvac_contrib
+    auto_triggered = True
+else:
+    if st.session_state.battery_active:
+        battery_contrib = 50.0
+        mitigation_impact += battery_contrib
+    if st.session_state.hvac_active:
+        hvac_contrib = raw_pred * 0.15
+        mitigation_impact += hvac_contrib
+
+net_load = max(0, raw_pred - solar_gen - mitigation_impact)
+breach = net_load > contract_limit
+excess = net_load - contract_limit
+penalty = 25000 if breach else 0
+
+# Failsafe button for the live demo
+if st.button("🔄 Re-arm Alarm"):
+    st.session_state.alert_sent = False
+# --- START OF TELEGRAM IOT TRIGGER (DEBUG MODE) ---
+if breach:
+    st.warning("⚠️ TRIGGER ACTIVATED: The code recognizes a breach!")  # Visual check
+
+    if 'alert_sent' not in st.session_state:
+        st.session_state.alert_sent = False
+
+    if not st.session_state.alert_sent:
+        bot_token = "8776866786:AAEviCpBk7T779Wdyd9fJAZwhA_qP4sDo5k"
+        chat_id = "1273048771"
+
+        msg = f"🚨 PEAKGUARD ALERT: Grid breach detected! Load is +{int(excess)} kW over the safe limit."
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage?chat_id={chat_id}&text={msg}"
+
+        try:
+            response = requests.get(url)
+            # This will show us exactly what Telegram's servers say:
+            if response.status_code == 200:
+                st.success("✅ Telegram message sent successfully!")
+                st.session_state.alert_sent = True
+            else:
+                st.error(f"❌ Telegram API Error: {response.text}")
+        except Exception as e:
+            st.error(f"❌ Connection Error: {e}")
+else:
+    st.session_state.alert_sent = False
+# --- END OF TELEGRAM IOT TRIGGER ---
+
+# Financials
+saved_co2 = (solar_gen + mitigation_impact) * 0.45
+grid_emissions = net_load * 0.45
+cost_no_solar = raw_pred * electricity_rate
+cost_with_solar = net_load * electricity_rate
+money_saved = cost_no_solar - cost_with_solar
+
+# -------------------------------------------------------------------
+# 5. DASHBOARD UI
+# -------------------------------------------------------------------
+st.divider()
+
+# ROW 1: METRICS
+c1, c2, c3, c4 = st.columns(4)
+
+with c1:
+    st.markdown("#### ⚡ Grid Load")
+    col = ['#ef4444', '#334155'] if breach else ['#22c55e', '#334155']
+    st.altair_chart(create_donut(net_load, contract_limit, "Load", col), use_container_width=True)
+    st.caption(f"**{int(net_load)} kW** / {int(contract_limit)} kW")
+
+with c2:
+    st.markdown("#### ☀️ Solar Gen")
+    st.altair_chart(create_donut(solar_gen, raw_pred, "Solar", ['#facc15', '#334155']), use_container_width=True)
+    st.caption(f"**{int(solar_gen)} kW** Generated")
+
+with c3:
+    st.markdown("#### 🌱 Avoided CO₂")
+    st.markdown(f"""
+    <div class="metric-card card-green">
+        <h3>Emissions Saved</h3>
+        <h1>{saved_co2:.1f} kg</h1>
+        <p>vs. standard grid mix</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+with c4:
+    st.markdown("#### 🏭 Grid Carbon")
+    st.markdown(f"""
+    <div class="metric-card card-red">
+        <h3>Grid Footprint</h3>
+        <h1>{grid_emissions:.1f} kg</h1>
+        <p>Dirty energy used</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+st.divider()
+
+# ROW 2: DETAILED INSIGHTS & AI
+col_fin, col_ai = st.columns([1.5, 2])
+
+with col_fin:
+    st.subheader("💵 Cost Analysis")
+    st.markdown(f"**Current Tariff:** <span style='color:{tariff_color}; font-weight:bold'>{rate_label}</span>",
+                unsafe_allow_html=True)
+
+    df = pd.DataFrame({
+        'Scenario': ['No AI/Solar', 'With PeakGuard'],
+        'Cost': [cost_no_solar, cost_with_solar],
+        'Color': ['#ef4444', '#22c55e']
+    })
+    chart = alt.Chart(df).mark_bar(cornerRadiusTopLeft=10, cornerRadiusTopRight=10).encode(
+        x=alt.X('Scenario', axis=None),
+        y='Cost',
+        color=alt.Color('Color', scale=None),
+        tooltip=['Cost']
+    ).properties(height=180)
+    text = chart.mark_text(dy=-10, color='white').encode(text=alt.Text('Cost', format='$.0f'))
+    st.altair_chart(chart + text, use_container_width=True)
+
+    st.success(f"**💰 Net Saving: ₹{money_saved:,.2f} / hr**")
+
+with col_ai:
+    st.subheader("🧠 PeakGuard Intelligence")
+
+    is_mitigated = st.session_state.battery_active or st.session_state.hvac_active
+
+    if auto_triggered:
+        header_class = "auto"
+        icon = "🤖"
+        title = "AUTO-PILOT ENGAGED"
+        diag_text = f"""
+        <b>Threat Neutralized.</b> AI instantly deployed <b style='color:#3b82f6'>{int(mitigation_impact)} kW</b> countermeasures.<br><br>
+        <b>OPTIMIZATION LOG:</b><br>
+        • 🔋 Battery Dispatch: <b>{int(battery_contrib)} kW</b><br>
+        • ❄️ HVAC Shift (1.5°C): <b>{int(hvac_contrib)} kW</b>
+        """
+        root_cause = "Autonomous System response to predicted grid breach."
+
+    elif breach:
+        header_class = "critical"
+        icon = "🚨"
+        title = "CRITICAL BREACH DETECTED"
+        diag_text = f"System is <b style='color:#ef4444'>+{int(excess)} kW</b> over limit."
+        root_cause = "Peak Tariff Hours coinciding with high AC load."
+
+    elif is_mitigated:
+        header_class = "safe"
+        icon = "🛡️"
+        title = "MITIGATION ACTIVE"
+        diag_text = f"Manual Actions reduced load by <b style='color:#22c55e'>{int(mitigation_impact)} kW</b>."
+        root_cause = "Operator intervention successful."
+
+    else:
+        header_class = "safe"
+        icon = "✅"
+        title = "SYSTEM OPTIMIZED"
+        diag_text = f"Load is <b style='color:#22c55e'>{int(contract_limit - net_load)} kW</b> below limit."
+        root_cause = "Passive solar integration effective."
+
+    # HTML CARD
+    html_top = ""
+    html_top += f'<div class="ai-container">'
+    html_top += f'  <div class="ai-header {header_class}">'
+    html_top += f'    <span style="font-size:1.5rem">{icon}</span> {title}'
+    html_top += f'  </div>'
+    html_top += f'  <div class="ai-body">'
+    html_top += f'    <div class="ai-label">DIAGNOSIS</div>'
+    html_top += f'    <div class="ai-text">{diag_text}</div>'
+    html_top += f'    <div class="ai-label">ROOT CAUSE</div>'
+    html_top += f'    <div class="ai-text" style="color:#cbd5e1; font-style:italic;">"{root_cause}"</div>'
+    html_top += f'    <div class="ai-label">RECOMMENDED ACTIONS</div>'
+
+    st.markdown(html_top, unsafe_allow_html=True)
+
+    if auto_triggered:
+        st.info("⚡ Autonomous Protocol Executed. System Secure.")
+    elif breach:
+        c_btn1, c_btn2 = st.columns(2)
+        with c_btn1:
+            if st.button("🔋 Dispatch Battery"):
+                st.session_state.battery_active = True
+                st.rerun()
+        with c_btn2:
+            if st.button("❄️ Optimize HVAC"):
+                st.session_state.hvac_active = True
+                st.rerun()
+        st.caption(f"Risk: ₹{penalty:,} penalty accruing now.")
+    elif is_mitigated:
+        st.success("✅ Intervention Successful")
+        if st.button("🔄 Reset System"):
+            st.session_state.battery_active = False
+            st.session_state.hvac_active = False
+            st.rerun()
+    else:
+        if solar_gen > 50:
+            safe_msg = '<div class="action-item opportunity"><b>❄️ PRE-COOL:</b> Use solar to supercool water loops.</div>'
+        else:
+            safe_msg = '<div class="action-item opportunity"><b>🔋 CHARGE:</b> Grid load is low; recharge main battery.</div>'
+        st.markdown(safe_msg, unsafe_allow_html=True)
+
+    st.markdown("</div></div>", unsafe_allow_html=True)
+
+# -------------------------------------------------------------------
+# 6. BLOCKCHAIN & REPORTING SECTION (BOTTOM)
+# -------------------------------------------------------------------
+st.divider()
+st.subheader("⛓️ Carbon Credits & Reporting")
+
+col_chain, col_report = st.columns([2, 1])
+
+with col_chain:
+    st.markdown("#### 💎 Decentralized Carbon Ledger (Polygon PoS)")
+    st.caption("Verify every kg of saved CO₂ on the immutable ledger. 1 Token = 10kg CO₂")
+
+    # MINTING BUTTON
+    if st.button("⛏️ Mint Carbon Credits for this Hour"):
+        if saved_co2 > 0:
+            tx_hash = mint_block(saved_co2)
+            st.balloons()
+            st.success(f"Minted! TX Hash: {tx_hash}")
+        else:
+            st.error("No CO₂ savings to mint right now.")
+
+    # DISPLAY LEDGER
+    if st.session_state.blockchain_ledger:
+        st.write("Recent Transactions:")
+        ledger_df = pd.DataFrame(st.session_state.blockchain_ledger)
+        st.dataframe(ledger_df[['timestamp', 'co2_saved', 'tokens_minted', 'hash']], use_container_width=True)
+    else:
+        st.info("No transactions yet. Save some CO₂ to mint tokens.")
+
+with col_report:
+    st.markdown("#### 📄 Audit Logs")
+    report_content = textwrap.dedent(f"""
+        PEAKGUARD AI - SHIFT REPORT
+        ----------------------------------
+        Date: {dt.date.today()}
+        Time: {hour_pick}:00
+        Auto-Pilot: {'ON' if st.session_state.auto_mode else 'OFF'}
+
+        Carbon Credits Minted: {len(st.session_state.blockchain_ledger)} Blocks
+        Total Wallet Balance: {st.session_state.wallet_balance:.2f} Tokens
+
+        FINANCIALS
+        Net Savings: ₹{money_saved:.2f}
+        Penalty Avoided: ₹{penalty}
+    """).strip()
+
+    st.download_button(
+        label="Download Shift Report",
+        data=report_content,
+        file_name="PeakGuard_Audit_Log.txt"
+    )
+
+# -------------------------------------------------------------------
+# 7. SIDEBAR WALLET
+# -------------------------------------------------------------------
+with st.sidebar:
+    st.divider()
+    st.subheader("💼 Carbon Wallet")
+    st.metric(label="PeakCoin Balance", value=f"{st.session_state.wallet_balance:.2f} PKG")
+    st.caption("Verifiable on simulated Polygon Testnet")
